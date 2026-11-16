@@ -7,6 +7,10 @@ struct Main {
         let args = CommandLine.arguments
         if args.contains("--dump") { Headless.dump(); return }
         if args.contains("--log") { Headless.log(); return }
+        if let i = args.firstIndex(of: "--set"), i + 1 < args.count {
+            let slot = args.firstIndex(of: "--slot").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 1
+            exit(Headless.set(args[i + 1], slot: slot) ? 0 : 1)
+        }
         if let i = args.firstIndex(of: "--screenshots"), i + 1 < args.count {
             Headless.screenshots(dir: args[i + 1]); return
         }
@@ -73,6 +77,42 @@ enum Headless {
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         print(String(decoding: try! enc.encode(out), as: UTF8.self))
         s.stop()
+    }
+
+    /// Sends one setting change and waits for the receiver to report it.
+    static func set(_ arg: String, slot: Int) -> Bool {
+        guard let change = SettingChange(arg: arg, slot: slot) else {
+            print("usage: --set lowCut|clippingControl|stereo|safetyTrack=on|off, voiceTone=regular|rich|bright, gain=-12|-6|0|6|12 [--slot N]")
+            return false
+        }
+        let s = MicStore.shared
+        s.start()
+        defer { s.stop() }
+        let ready = Date().addingTimeInterval(6)
+        while Date() < ready && (s.state.rx?.name == nil || s.state.txSettings == nil && !change.isRxSetting) {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        }
+        guard s.state.link == .connected, s.state.rx?.name != nil else {
+            print("receiver not available (\(s.state.link.rawValue))"); return false
+        }
+        print("before: \(summary(s.state))")
+        if change.isReflected(in: s.state) { print("already set"); return true }
+        s.apply(change)
+        let deadline = Date().addingTimeInterval(6)
+        while Date() < deadline && !change.isReflected(in: s.state) {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        }
+        print("after:  \(summary(s.state))")
+        let ok = change.isReflected(in: s.state)
+        print(ok ? "OK: receiver confirmed \(arg)" : "FAILED: receiver did not report \(arg) within 6 s")
+        return ok
+    }
+
+    private static func summary(_ st: MicState) -> String {
+        func b(_ v: Bool?) -> String { v.map { $0 ? "on" : "off" } ?? "?" }
+        let tones = st.transmitters.map { "tone\($0.slot)=\(VoiceTone(tx: $0)?.rawValue ?? "?")" }.joined(separator: " ")
+        return "lowCut=\(b(st.txSettings?.lowCut)) clipping=\(b(st.txSettings?.clippingControl)) \(tones) "
+            + "stereo=\(b(st.rx?.stereo)) gain=\(st.rx?.gain.map(String.init) ?? "?") safetyTrack=\(b(st.rx?.safetyTrack))"
     }
 
     static func snapshot(prefix: String) {
@@ -146,10 +186,9 @@ enum Headless {
             let store = MicStore()
             store.preview(state: state, caseConnected: box, levels: levels)
             for scheme in [ColorScheme.light, .dark] {
-                let view = PopoverView(store: store, levels: store.levels, showsFooterControls: false)
-                    .background(Color(nsColor: .windowBackgroundColor))
-                    .environment(\.colorScheme, scheme)
-                write(ImageRenderer(content: view), to: "\(dir)/panel-\(name)-\(scheme == .dark ? "dark" : "light").png")
+                let view = PopoverView(store: store, levels: store.levels, showsFooterControls: false,
+                                       drawsStaticSwitches: true)
+                writeWindow(view, dark: scheme == .dark, to: "\(dir)/panel-\(name)-\(scheme == .dark ? "dark" : "light").png")
             }
         }
         // Menu bar states, drawn on a light and a dark bar.
@@ -201,6 +240,25 @@ enum Headless {
         }
         .padding(16).foregroundStyle(.black).background(Color.white)
         write(ImageRenderer(content: v), to: path)
+    }
+
+    /// Renders through an off-screen AppKit window so switches and menus (which ImageRenderer
+    /// can't draw) show up.
+    private static func writeWindow<V: View>(_ view: V, dark: Bool, to path: String) {
+        _ = NSApplication.shared
+        let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
+        host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        let size = host.fittingSize
+        host.frame = NSRect(origin: .zero, size: size)
+        let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        win.appearance = host.appearance
+        win.contentView = host
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { print("render failed: \(path)"); return }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        print("wrote \(path)")
     }
 
     private static func write<V: View>(_ r: ImageRenderer<V>, to path: String) {

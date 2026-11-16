@@ -2,8 +2,9 @@ import Foundation
 import IOKit
 import IOKit.usb
 
-/// Background thread that owns the receiver's vendor bulk interface and streams status.
-/// Never touches the device configuration (the same device is the live audio input).
+/// Background thread that owns the receiver's vendor bulk interface: streams status and sends
+/// queued setting changes. Never touches the USB configuration (the same device is the live
+/// audio input).
 final class MicReader {
     var onState: ((MicState) -> Void)?
     var onLevels: (([Int: Int]) -> Void)?
@@ -16,6 +17,19 @@ final class MicReader {
     }
     private var thread: Thread?
     private var finished = DispatchSemaphore(value: 0)
+    private var _outbox: [SettingChange] = []
+
+    /// Queues setting changes; they are written on the reader thread before the next read.
+    func send(_ changes: [SettingChange]) {
+        lock.lock(); _outbox += changes; lock.unlock()
+    }
+
+    private func takeOutbox() -> [SettingChange] {
+        lock.lock(); defer { lock.unlock() }
+        let o = _outbox; _outbox.removeAll(); return o
+    }
+
+    private var hasOutbox: Bool { lock.lock(); defer { lock.unlock() }; return !_outbox.isEmpty }
 
     func start() {
         let t = Thread { [weak self] in self?.run(); self?.finished.signal() }
@@ -69,7 +83,8 @@ final class MicReader {
             if alt { _ = libusb_set_interface_alt_setting(h, ifc, 1) }
 
             lastLink = .connected
-            stream(handle: h!, endpoint: UInt8(ifc))
+            _ = takeOutbox()   // drop changes queued while disconnected
+            stream(handle: h!, endpoint: UInt8(0x80 | ifc), out: outEndpoint(dev, interface: ifc) ?? UInt8(ifc))
 
             _ = libusb_release_interface(h, ifc)
             libusb_close(h)
@@ -79,7 +94,7 @@ final class MicReader {
         }
     }
 
-    private func stream(handle h: OpaquePointer, endpoint ep: UInt8) {
+    private func stream(handle h: OpaquePointer, endpoint inEP: UInt8, out outEP: UInt8) {
         var state = MicState(link: .connected)
         var published = state
         onState?(state)
@@ -88,10 +103,29 @@ final class MicReader {
         var pendingLevels: [Int: Int] = [:]
         var lastFlush = Date.distantPast
         let timeoutErr = Int32(LIBUSB_ERROR_TIMEOUT.rawValue)
+        var seq: UInt16 = 0
+
+        func write(_ frame: [UInt8]) {
+            var f = frame
+            var sent: Int32 = 0
+            let r = libusb_bulk_transfer(h, outEP, &f, Int32(f.count), &sent, 1000)
+            if r != 0 { NSLog("DJIMicBar: write failed (\(r))") }
+            seq &+= 1
+        }
 
         while !stopped {
+            // Like dji-mic-mo, only send once the receiver has identified itself.
+            let changes = state.rx?.name != nil ? takeOutbox() : []
+            if !changes.isEmpty {
+                write(Frame.time(seq: seq))
+                for c in changes {
+                    guard let e = c.encoded else { continue }
+                    write(Frame.set(seq: seq, addr: e.addr, cmd: e.cmd, val: e.val))
+                }
+            }
+
             var got: Int32 = 0
-            let r = libusb_bulk_transfer(h, 0x80 | ep, &chunk, Int32(chunk.count), &got, 250)
+            let r = libusb_bulk_transfer(h, inEP, &chunk, Int32(chunk.count), &got, hasOutbox ? 20 : 250)
             if got > 0 {
                 for pkt in parser.feed(chunk[0..<Int(got)]) {
                     pendingLevels.merge(apply(packet: pkt, to: &state)) { _, new in new }
@@ -133,6 +167,28 @@ final class MicReader {
             if hasEndpoint(dev, interface: ifc, address: UInt8(0x80 | ifc)) {
                 libusb_ref_device(dev)
                 return (dev, ifc, desc.idProduct != 0x4011)
+            }
+        }
+        return nil
+    }
+
+    /// The bulk OUT endpoint of `interface` (0x06 on the Mic Mini receiver).
+    private func outEndpoint(_ dev: OpaquePointer, interface: Int32) -> UInt8? {
+        var cfg: UnsafeMutablePointer<libusb_config_descriptor>?
+        if libusb_get_active_config_descriptor(dev, &cfg) != 0 {
+            guard libusb_get_config_descriptor(dev, 0, &cfg) == 0 else { return nil }
+        }
+        guard let c = cfg else { return nil }
+        defer { libusb_free_config_descriptor(c) }
+        for ii in 0..<Int(c.pointee.bNumInterfaces) {
+            let itf = c.pointee.interface[ii]
+            for a in 0..<Int(itf.num_altsetting) {
+                let alt = itf.altsetting[a]
+                guard Int32(alt.bInterfaceNumber) == interface else { continue }
+                for e in 0..<Int(alt.bNumEndpoints) {
+                    let ep = alt.endpoint[e]
+                    if ep.bEndpointAddress & 0x80 == 0, ep.bmAttributes & 0x03 == 2 { return ep.bEndpointAddress }
+                }
             }
         }
         return nil

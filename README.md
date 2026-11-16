@@ -15,11 +15,14 @@ It shows:
 - **Transmitter battery** (7 steps, as reported by the receiver) and charging state, per linked mic
 - **What's connected**: mic(s) linked to the receiver, receiver on USB, charging case on USB
 - **Live input level** per mic
-- **Current settings**: noise cancellation, low cut, voice tone, clipping control, mono/stereo, gain, safety track
+- **Settings you can change from the panel**: low cut, voice tone, clipping control (mic);
+  mono/stereo, output gain, safety track (receiver). Noise cancellation is shown but read-only: on a
+  Mic Mini 2 kit the receiver doesn't accept it, so use the button on the mic.
 
-Everything is read-only. The app reads the receiver's vendor USB interface (libusb, statically
-linked). It does not change the device configuration or touch the audio interface, so the mic keeps
-working as a normal audio input.
+The app talks to the receiver's vendor USB interface (libusb, statically linked) using the same
+commands as dji-mic-mo. It does not change the USB configuration or touch the audio interface, so
+the mic keeps working as a normal audio input. A changed setting shows once the receiver reports the
+new value, usually within a second.
 
 ## Requirements
 
@@ -45,6 +48,9 @@ Copy `build/DJIMicBar.app` to `/Applications` if you want to use **Open at Login
 BIN=build/DJIMicBar.app/Contents/MacOS/DJIMicBar
 $BIN --dump                  # read the receiver for 5 s, print parsed state as JSON
 $BIN --log                   # print a timestamped line on every state change (until Ctrl-C)
+$BIN --set lowCut=off        # change one setting and wait for the receiver to confirm it
+                             # keys: lowCut, clippingControl, voiceTone (regular|rich|bright,
+                             # --slot N for mic N), stereo, gain (-12|-6|0|6|12), safetyTrack
 $BIN --snapshot /tmp/snap    # render the panel from live data to PNGs
 $BIN --screenshots docs/screenshots   # render README screenshots from demo states
 $BIN --glyphs /tmp/glyphs.png         # render all icon variants

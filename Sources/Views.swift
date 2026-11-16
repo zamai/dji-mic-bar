@@ -130,6 +130,9 @@ struct PopoverView: View {
     @ObservedObject var store: MicStore
     @ObservedObject var levels: LevelStore
     var showsFooterControls = true
+    var showsSettingControls = true
+    /// Screenshots only: AppKit draws switches as inactive when rendered off-screen.
+    var drawsStaticSwitches = false
 
     private var state: MicState { store.state }
 
@@ -147,25 +150,21 @@ struct PopoverView: View {
                 SectionCard(title: "Microphone") {
                     SettingRow(icon: "waveform.badge.minus", title: "Noise Cancellation",
                                value: noiseValue(s), on: s.noiseCancellation == true)
-                    SettingRow(icon: "dial.low", title: "Low Cut", value: onOff(s.lowCut), on: s.lowCut == true)
-                    if let tx = state.transmitters.first, tx.voiceToneRich != nil {
-                        SettingRow(icon: "person.wave.2", title: "Voice Tone", value: tone(tx),
-                                   on: tx.voiceToneRich == true || tx.voiceToneBright == true)
+                        .help("Set with the button on the mic. The receiver doesn't accept this change for Mic Mini 2.")
+                    boolRow(icon: "dial.low", title: "Low Cut", current: s.lowCut) { .lowCut($0) }
+                    ForEach(state.transmitters.filter { VoiceTone(tx: $0) != nil }, id: \.slot) { tx in
+                        toneRow(tx)
                     }
-                    SettingRow(icon: "waveform.path.ecg", title: "Clipping Control",
-                               value: onOff(s.clippingControl), on: s.clippingControl == true)
+                    boolRow(icon: "waveform.path.ecg", title: "Clipping Control", current: s.clippingControl) {
+                        .txClippingControl($0)
+                    }
                 }
             }
             if let rx = state.rx, state.link == .connected {
                 SectionCard(title: "Receiver") {
-                    SettingRow(icon: "speaker.wave.2", title: "Channel",
-                               value: rx.stereo == true ? "Stereo" : "Mono", on: true)
-                    if let g = rx.gain {
-                        SettingRow(icon: "slider.horizontal.3", title: "Output Gain",
-                                   value: g == 0 ? "0 dB" : String(format: "%+d dB", g), on: g != 0)
-                    }
-                    SettingRow(icon: "square.on.square", title: "Safety Track",
-                               value: onOff(rx.safetyTrack), on: rx.safetyTrack == true)
+                    channelRow(rx)
+                    if rx.gain != nil { gainRow(rx) }
+                    boolRow(icon: "square.on.square", title: "Safety Track", current: rx.safetyTrack) { .safetyTrack($0) }
                 }
             }
             if showsFooterControls { footer }
@@ -260,16 +259,89 @@ struct PopoverView: View {
         }
     }
 
+    // MARK: Editable rows
+
+    private var editable: Bool { showsSettingControls && state.link == .connected }
+
+    @ViewBuilder
+    private func boolRow(icon: String, title: String, current: Bool?,
+                         make: @escaping (Bool) -> SettingChange) -> some View {
+        let key = make(false).key
+        let value: Bool? = {
+            switch store.pendingChange(key) {
+            case .lowCut(let v)?, .txClippingControl(let v)?, .stereo(let v)?, .safetyTrack(let v)?: return v
+            default: return current
+            }
+        }()
+        SettingRow(icon: icon, title: title, value: onOff(value), on: value == true) {
+            if editable, let value {
+                let toggle = Toggle(title, isOn: Binding(get: { value }, set: { store.apply(make($0)) }))
+                    .labelsHidden()
+                if drawsStaticSwitches {
+                    toggle.toggleStyle(StaticSwitchStyle())
+                } else {
+                    toggle.toggleStyle(.switch).controlSize(.mini)
+                }
+            } else {
+                SettingValue(onOff(value))
+            }
+        }
+    }
+
+    private func toneRow(_ tx: TxInfo) -> some View {
+        var tone = VoiceTone(tx: tx) ?? .regular
+        if case .voiceTone(_, let t)? = store.pendingChange("voiceTone\(tx.slot)") { tone = t }
+        let title = state.transmitters.count > 1 ? "Voice Tone (Mic \(tx.slot))" : "Voice Tone"
+        return SettingRow(icon: "person.wave.2", title: title, value: tone.rawValue, on: tone != .regular) {
+            if editable {
+                Picker(title, selection: Binding(get: { tone }, set: { store.apply(.voiceTone(slot: tx.slot, $0)) })) {
+                    ForEach(VoiceTone.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
+            } else {
+                SettingValue(tone.rawValue)
+            }
+        }
+    }
+
+    private func channelRow(_ rx: RxInfo) -> some View {
+        var stereo = rx.stereo == true
+        if case .stereo(let v)? = store.pendingChange("stereo") { stereo = v }
+        return SettingRow(icon: "speaker.wave.2", title: "Channel", value: stereo ? "Stereo" : "Mono", on: true) {
+            if editable && rx.stereo != nil {
+                Picker("Channel", selection: Binding(get: { stereo }, set: { store.apply(.stereo($0)) })) {
+                    Text("Mono").tag(false)
+                    Text("Stereo").tag(true)
+                }
+                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
+            } else {
+                SettingValue(stereo ? "Stereo" : "Mono")
+            }
+        }
+    }
+
+    private func gainRow(_ rx: RxInfo) -> some View {
+        var g = rx.gain ?? 0
+        if case .gain(let v)? = store.pendingChange("gain") { g = v }
+        func label(_ g: Int) -> String { g == 0 ? "0 dB" : String(format: "%+d dB", g) }
+        let steps = SettingChange.gainSteps.contains(g) ? SettingChange.gainSteps : (SettingChange.gainSteps + [g]).sorted()
+        return SettingRow(icon: "slider.horizontal.3", title: "Output Gain", value: label(g), on: g != 0) {
+            if editable {
+                Picker("Output Gain", selection: Binding(get: { g }, set: { store.apply(.gain($0)) })) {
+                    ForEach(steps, id: \.self) { Text(label($0)).tag($0) }
+                }
+                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
+            } else {
+                SettingValue(label(g))
+            }
+        }
+    }
+
     private func onOff(_ b: Bool?) -> String { b == nil ? "—" : (b! ? "On" : "Off") }
     private func noiseValue(_ s: TxSettings) -> String {
         guard let nc = s.noiseCancellation else { return "—" }
         if !nc { return "Off" }
         return s.noiseCancellationStrong == true ? "Strong" : "On"
-    }
-    private func tone(_ tx: TxInfo) -> String {
-        if tx.voiceToneRich == true { return "Rich" }
-        if tx.voiceToneBright == true { return "Bright" }
-        return "Regular"
     }
 }
 
@@ -368,11 +440,16 @@ struct SectionCard<Content: View>: View {
     }
 }
 
-struct SettingRow: View {
+struct SettingRow<Control: View>: View {
     var icon: String
     var title: String
     var value: String
     var on: Bool
+    var control: Control
+
+    init(icon: String, title: String, value: String, on: Bool, @ViewBuilder control: () -> Control) {
+        self.icon = icon; self.title = title; self.value = value; self.on = on; self.control = control()
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -384,12 +461,22 @@ struct SettingRow: View {
             .frame(width: 24, height: 24)
             Text(title).font(.system(size: 12))
             Spacer()
-            Text(value).font(.system(size: 12)).foregroundStyle(.secondary)
+            control
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
+        .frame(minHeight: 32)
     }
 }
+
+extension SettingRow where Control == Text {
+    init(icon: String, title: String, value: String, on: Bool) {
+        self.init(icon: icon, title: title, value: value, on: on) { SettingValue(value) }
+    }
+}
+
+/// Read-only value on the right of a setting row.
+func SettingValue(_ s: String) -> Text { Text(s).font(.system(size: 12)).foregroundColor(.secondary) }
 
 struct LoginToggle: View {
     @State private var enabled = SMAppService.mainApp.status == .enabled
@@ -404,5 +491,16 @@ struct LoginToggle: View {
             enabled = SMAppService.mainApp.status == .enabled
         }))
         .toggleStyle(.checkbox)
+    }
+}
+
+/// Look-alike of a mini macOS switch in the active state, for rendering screenshots.
+struct StaticSwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        ZStack(alignment: configuration.isOn ? .trailing : .leading) {
+            Capsule().fill(configuration.isOn ? Color.accentColor : Color.primary.opacity(0.12))
+            Circle().fill(.white).shadow(color: .black.opacity(0.25), radius: 0.5, y: 0.5).padding(1.5)
+        }
+        .frame(width: 26, height: 15)
     }
 }

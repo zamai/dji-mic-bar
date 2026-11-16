@@ -1,7 +1,7 @@
 import Foundation
 
 // Port of the DJI Mic receiver USB protocol parser from
-// https://github.com/usokawa/dji-mic-mo (dji-mic-mo.py). Read-only.
+// https://github.com/usokawa/dji-mic-mo (dji-mic-mo.py), including its "set" commands.
 
 enum CRC {
     static let t8: [UInt8] = (0..<256).map { i in
@@ -222,4 +222,119 @@ func apply(packet pkt: [UInt8], to state: inout MicState) -> [Int: Int] {
         state.txSettings = s
     }
     return levels
+}
+
+// MARK: - Writing settings
+
+enum VoiceTone: String, CaseIterable, Codable {
+    case regular = "Regular", rich = "Rich", bright = "Bright"
+
+    init?(tx: TxInfo) {
+        guard tx.voiceToneRich != nil || tx.voiceToneBright != nil else { return nil }
+        self = tx.voiceToneRich == true ? .rich : (tx.voiceToneBright == true ? .bright : .regular)
+    }
+}
+
+/// A setting change, as sent by dji-mic-mo's "apply config" path. Only settings that dji-mic-mo
+/// allows writing on a DJI Mic Mini 2 receiver are listed (noise cancellation is not).
+enum SettingChange: Equatable {
+    case lowCut(Bool)                       // all transmitters
+    case txClippingControl(Bool)            // all transmitters
+    case voiceTone(slot: Int, VoiceTone)    // one transmitter
+    case stereo(Bool)                       // receiver
+    case safetyTrack(Bool)                  // receiver
+    case gain(Int)                          // receiver, -12 / -6 / 0 / 6 / 12 dB
+
+    static let gainSteps = [-12, -6, 0, 6, 12]
+
+    var isRxSetting: Bool {
+        switch self { case .stereo, .safetyTrack, .gain: true; default: false }
+    }
+
+    /// Identifies which setting this changes (one pending value per key).
+    var key: String {
+        switch self {
+        case .lowCut: "lowCut"
+        case .txClippingControl: "txClippingControl"
+        case .voiceTone(let slot, _): "voiceTone\(slot)"
+        case .stereo: "stereo"
+        case .safetyTrack: "safetyTrack"
+        case .gain: "gain"
+        }
+    }
+
+    func isReflected(in s: MicState) -> Bool {
+        switch self {
+        case .lowCut(let v): s.txSettings?.lowCut == v
+        case .txClippingControl(let v): s.txSettings?.clippingControl == v
+        case .voiceTone(let slot, let t): s.tx[slot].map { VoiceTone(tx: $0) == t } ?? false
+        case .stereo(let v): s.rx?.stereo == v
+        case .safetyTrack(let v): s.rx?.safetyTrack == v
+        case .gain(let v): s.rx?.gain == v
+        }
+    }
+
+    /// (node address, command, value). Node 0x0000 = receiver, 0xffff = all transmitters,
+    /// 1/2/4/8 = transmitter slot 1…4.
+    var encoded: (addr: UInt16, cmd: UInt8, val: UInt8)? {
+        switch self {
+        case .lowCut(let on): return (0xffff, 0x03, on ? 1 : 0)
+        case .txClippingControl(let on): return (0xffff, 0x24, on ? 1 : 0)
+        case .voiceTone(let slot, let tone):
+            guard (1...4).contains(slot) else { return nil }
+            let v: UInt8 = switch tone { case .regular: 0; case .rich: 1; case .bright: 2 }
+            return (UInt16(1) << (slot - 1), 0x29, v)
+        case .stereo(let on): return (0x0000, 0x08, on ? 2 : 0)
+        case .safetyTrack(let on): return (0x0000, 0x21, on ? 1 : 0)
+        case .gain(let db):
+            guard Self.gainSteps.contains(db) else { return nil }
+            return (0x0000, 0x39, UInt8(bitPattern: Int8(db)))
+        }
+    }
+
+    /// Parses "key=value" (for --set), e.g. lowCut=off, voiceTone=rich, gain=-6.
+    init?(arg: String, slot: Int = 1) {
+        let parts = arg.split(separator: "=", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        let v = parts[1].lowercased()
+        let b: Bool? = ["on", "true", "1", "yes", "stereo"].contains(v) ? true
+            : (["off", "false", "0", "no", "mono"].contains(v) ? false : nil)
+        switch parts[0] {
+        case "lowCut": guard let b else { return nil }; self = .lowCut(b)
+        case "clippingControl": guard let b else { return nil }; self = .txClippingControl(b)
+        case "voiceTone": guard let t = VoiceTone.allCases.first(where: { $0.rawValue.lowercased() == v }) else { return nil }
+            self = .voiceTone(slot: slot, t)
+        case "stereo", "channel": guard let b else { return nil }; self = .stereo(b)
+        case "safetyTrack": guard let b else { return nil }; self = .safetyTrack(b)
+        case "gain": guard let g = Int(v) else { return nil }; self = .gain(g)
+        default: return nil
+        }
+    }
+}
+
+enum Frame {
+    private static func build(seq: UInt16, body: [UInt8]) -> [UInt8] {
+        let len = 8 + body.count + 2
+        var p: [UInt8] = [0x55, UInt8(len & 0xff), UInt8((len >> 8) & 0x03) | 0x04]
+        p.append(CRC.crc8(p))
+        p += [0x02, 0x5a, UInt8(seq & 0xff), UInt8(seq >> 8)]
+        p += body
+        let c = CRC.crc16(p)
+        p += [UInt8(c & 0xff), UInt8(c >> 8)]
+        return p
+    }
+
+    /// Set-parameter frame (dji-mic-mo `send`).
+    static func set(seq: UInt16, addr: UInt16, cmd: UInt8, val: UInt8) -> [UInt8] {
+        build(seq: seq, body: [0x40, 0x5b, 0x01, 0x02, UInt8(addr & 0xff), UInt8(addr >> 8), 0x00, 0x00,
+                               cmd, 0x00, 0x01, val])
+    }
+
+    /// Clock sync frame that dji-mic-mo sends before each batch of settings (`send_time`).
+    static func time(seq: UInt16, date: Date = Date()) -> [UInt8] {
+        let c = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return build(seq: seq, body: [0x40, 0x5b, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x08, 0x09,
+                                      UInt8(c.year! % 100), UInt8(c.month!), UInt8(c.day!),
+                                      UInt8(c.hour!), UInt8(c.minute!), UInt8(c.second!), 0x00])
+    }
 }

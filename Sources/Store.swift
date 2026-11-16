@@ -46,7 +46,7 @@ final class MicStore: ObservableObject {
         reader.start()
         refreshUSB()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshUSB() }
+            MainActor.assumeIsolated { self?.refreshUSB(); self?.prunePending() }
         }
     }
 
@@ -64,9 +64,34 @@ final class MicStore: ObservableObject {
         renderMenuBarImage()
     }
 
+    /// Sends a setting change to the receiver. The UI updates when the receiver reports the new
+    /// value in its next status packet.
+    func apply(_ change: SettingChange) {
+        guard state.link == .connected, change.encoded != nil else { return }
+        if change.isReflected(in: state) { return }
+        pending[change.key] = (change, Date().addingTimeInterval(3))
+        reader.send([change])
+    }
+
+    /// Changes sent but not yet confirmed by a status packet. Shown in the UI for up to 3 s so
+    /// controls don't snap back while the receiver applies them; then device state wins.
+    @Published private(set) var pending: [String: (change: SettingChange, until: Date)] = [:]
+
+    func pendingChange(_ key: String) -> SettingChange? {
+        guard let p = pending[key], p.until > Date() else { return nil }
+        return p.change
+    }
+
+    private func prunePending() {
+        let now = Date()
+        let next = pending.filter { $0.value.until > now && !$0.value.change.isReflected(in: state) }
+        if next.count != pending.count { pending = next }
+    }
+
     private func set(state s: MicState) {
         guard s != state else { return }
         state = s
+        prunePending()
         levels.retain(slots: Set(s.tx.keys))
         renderMenuBarImage()
     }
