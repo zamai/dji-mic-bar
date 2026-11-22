@@ -5,6 +5,7 @@
   <key>CFBundleName</key><string>DJI Mic Bar</string>
   <key>CFBundleDisplayName</key><string>DJI Mic Bar</string>
   <key>CFBundleIdentifier</key><string>local.djimicbar</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleExecutable</key><string>DJIMicBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

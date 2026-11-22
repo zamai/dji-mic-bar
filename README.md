@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="128" alt="">
+
 # DJI Mic Bar
 
 A macOS menu bar app, styled like the AirPods menu, for the **DJI Mic Mini / Mic Mini 2** wireless
@@ -37,10 +39,18 @@ new value, usually within a second.
 ```sh
 brew install libusb
 ./build.sh                 # -> build/DJIMicBar.app (ad-hoc signed)
-open build/DJIMicBar.app
+./build.sh --install       # build, replace "/Applications/DJI Mic Bar.app" and start it
 ```
 
-Copy `build/DJIMicBar.app` to `/Applications` if you want to use **Open at Login**.
+Install it to find it in Spotlight or Alfred and to use **Open at Login**. It's a menu bar app, so
+launching it only adds the mic icon to the menu bar; no window opens.
+
+The app icon is committed as `Resources/AppIcon.icns` and packaged by every build. To change it,
+edit `tools/make-icon.swift` and regenerate:
+
+```sh
+swift tools/make-icon.swift Resources/AppIcon.icns docs/icon.png
+```
 
 ## Debug modes
 
